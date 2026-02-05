@@ -24,20 +24,38 @@ const predictUnbillable = async (req, res) => {
         // 3. Rent
         // 4. LogInefficiency = Math.log(101 - Utilization) -> Non-Linear Scaling for drops in efficiency
         // 5. WasteInteraction = Headcount * (100 - Utilization) -> Scale Proportional Weighting
-        const transform = (h, s, r, u) => {
-            const util = parseFloat(u);
-            const logIneff = Math.log(101 - util);
-            
-            const waste = parseFloat(h) * (100 - util);
-            return [parseFloat(h), parseFloat(s), parseFloat(r), logIneff, waste];
-        };
+        // 6. StartupFriction = (100 - Utilization) * Exp(-Headcount/10) -> Sensitivity for Small Teams
+        // const transform = (h, s, r, u) => {
+        //     const util = parseFloat(u);
+        //     const hc = parseFloat(h);
+        //     const logIneff = Math.log(101 - util);
 
+        //     const waste = hc * (100 - util);
+        //     const startupFriction = (100 - util) * Math.exp(-hc / 10);
+
+        //     return [hc, parseFloat(s), parseFloat(r), logIneff, waste, startupFriction];
+        // };
+
+        const transform = (h, s, r, u) => {
+            const hc = parseFloat(h);
+            const util = parseFloat(u);
+
+            // Feature 1: Square root of headcount instead of raw headcount
+            // This reduces the "Weight" of large numbers (e.g. 200 becomes 14)
+            const normalizedHC = Math.sqrt(hc);
+
+            const logIneff = Math.log(101 - util);
+            const waste = hc * (100 - util);
+            const startupFriction = (100 - util) * Math.exp(-hc / 10);
+
+            return [normalizedHC, parseFloat(s), parseFloat(r), logIneff, waste, startupFriction];
+        };
 
         const X = data.map(row => transform(row.headcount, row.software_costs, row.rent, row.utilization_percentage));
         const Y = data.map(row => [parseFloat(row.actual_unbillable_expenditure)]);
 
 
-        const numFeatures = 5;
+        const numFeatures = 6;
         const sums = new Array(numFeatures).fill(0);
         X.forEach(row => {
             row.forEach((val, idx) => sums[idx] += val);
@@ -46,7 +64,7 @@ const predictUnbillable = async (req, res) => {
 
 
         const mlr = new MLR(X, Y);
-        const weights = mlr.weights; // [w_hc, w_soft, w_rent, w_logIneff, w_waste]
+        const weights = mlr.weights; // [w_hc, w_soft, w_rent, w_logIneff, w_waste, w_startup]
 
         // Prepare Prediction Input
         const inputFeatures = transform(headcount, software_costs, rent, utilization);
@@ -62,7 +80,8 @@ const predictUnbillable = async (req, res) => {
             'Software Infrastructure',
             'Fixed Rent',
             'Efficiency Drop (Exponential)',
-            'Scale-Adjusted Waste'
+            'Scale-Adjusted Waste',
+            'Startup Frictional Waste'
         ];
 
         // Impact = Weight * (InputValue - MeanValue)
@@ -90,15 +109,17 @@ const predictUnbillable = async (req, res) => {
             } else {
                 mainDriver = 'Utilization Variance';
             }
+        } else if (mainDriver === 'Startup Frictional Waste') {
+            mainDriver = 'Small Team Inefficiency (Startup Friction)';
         } else if (mainDriver === 'Headcount Volume') {
             mainDriver = `Headcount Variance`;
         }
 
         // --- Guardrail Logic ---
-        const rentValue = parseFloat(rent);
-        if (predictedUnbillable < rentValue || isNaN(predictedUnbillable)) {
-            predictedUnbillable = rentValue;
-            mainDriver = 'Fixed Infrastructure Costs (Rent Floor)';
+        const totalFixed = parseFloat(rent) + parseFloat(software_costs);
+        if (predictedUnbillable < totalFixed || isNaN(predictedUnbillable)) {
+            predictedUnbillable = totalFixed;
+            mainDriver = 'Fixed Infrastructure Costs (Floor Hit)';
         } else {
             predictedUnbillable = Math.max(0, predictedUnbillable);
         }
@@ -110,7 +131,7 @@ const predictUnbillable = async (req, res) => {
                 weights: weights,
                 means: means,
                 intercept: mlr.intercept || 0,
-                description: 'Transformed Linear Regression: HC, Soft, Rent, Log(101-Util), HC*(100-Util)'
+                description: 'Transformed Linear Regression: HC, Soft, Rent, Log(101-Util), HC*(100-Util), StartupFriction'
             },
             impact_analysis: impacts,
             debug_inputs: inputFeatures
