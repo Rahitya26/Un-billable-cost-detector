@@ -1,14 +1,10 @@
 import React from 'react';
 
 const FormattedNumberInput = ({ label, name, value, onChange, placeholder, required = false }) => {
-    // Format for display: 1234 -> 1,234
     const displayValue = value ? Number(value).toLocaleString('en-IN') : '';
 
     const handleChange = (e) => {
-        // Strip commas/spaces to get raw number
         const rawValue = e.target.value.replace(/[^0-9.]/g, '');
-
-        // Parent expects { target: { name, value } }
         onChange({
             target: {
                 name: name,

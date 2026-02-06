@@ -3,43 +3,75 @@ const MLR = require('ml-regression-multivariate-linear');
 
 const predictUnbillable = async (req, res) => {
     try {
-        const { headcount, software_costs, rent, utilization } = req.body;
+        let { headcount, software_costs, rent, utilization } = req.body;
+
+        // Sanitize and Parse Inputs
+        const parseInput = (val) => {
+            if (val === undefined || val === null) return undefined;
+            const strVal = String(val).replace(/,/g, ''); // Remove commas
+            const num = parseFloat(strVal);
+            return isNaN(num) ? undefined : num;
+        };
+
+        headcount = parseInput(headcount);
+        software_costs = parseInput(software_costs);
+        rent = parseInput(rent);
+        utilization = parseInput(utilization);
 
         if (headcount === undefined || software_costs === undefined || rent === undefined || utilization === undefined) {
-            return res.status(400).json({ error: 'Missing required fields: headcount, software_costs, rent, utilization' });
+            return res.status(400).json({ error: 'Missing or invalid required fields: headcount, software_costs, rent, utilization' });
+        }
+
+        // Validation Short-Circuit: Inactive Organization
+        if (headcount <= 0 || utilization < 0) {
+            return res.json({
+                predicted_unbillable_expenditure: 0,
+                main_driver: "Inactive Organization"
+            });
+        }
+
+        // Cap Utilization at 100 to prevent Math.log() NaN or Domain Errors
+        if (utilization > 100) {
+            utilization = 100;
         }
 
         // Fetch historical data
-        const result = await db.query('SELECT headcount, software_costs, rent, utilization_percentage, actual_unbillable_expenditure FROM organization_metrics ORDER BY month_year ASC');
+        // 1. Try to find "Peer Data" (+/- 50% range)
+        const lowerBound = Math.floor(headcount * 0.5);
+        const upperBound = Math.ceil(headcount * 1.5);
+
+        let result = await db.query(
+            'SELECT headcount, software_costs, rent, utilization_percentage, actual_unbillable_expenditure FROM organization_metrics WHERE headcount BETWEEN $1 AND $2',
+            [lowerBound, upperBound]
+        );
+
+        // 2. FALLBACK: If no peers found, use the entire database
+        if (result.rows.length < 2) {
+            result = await db.query(
+                'SELECT headcount, software_costs, rent, utilization_percentage, actual_unbillable_expenditure FROM organization_metrics ORDER BY headcount ASC'
+            );
+        }
+
+        // 3. FINAL GUARD: If still no data, return a basic calculator result
+        if (result.rows.length < 2) {
+            const baseline = parseFloat(rent) + parseFloat(software_costs);
+            const wasteFactor = (100 - utilization) * (headcount * 50); // Simple heuristic
+            return res.json({
+                predicted_unbillable_expenditure: baseline + wasteFactor,
+                main_driver: "Heuristic Estimate (Insufficient Historical Data)"
+            });
+        }
+
         const data = result.rows;
 
         if (data.length < 2) {
             return res.status(400).json({ error: 'Not enough historical data to generate a prediction (need at least 2 records).' });
         }
 
-        // --- Feature Engineering Helper ---
-        // Transform inputs into model features
-        // 1. Headcount
-        // 2. Software
-        // 3. Rent
-        // 4. LogInefficiency = Math.log(101 - Utilization) -> Non-Linear Scaling for drops in efficiency
-        // 5. WasteInteraction = Headcount * (100 - Utilization) -> Scale Proportional Weighting
-        // 6. StartupFriction = (100 - Utilization) * Exp(-Headcount/10) -> Sensitivity for Small Teams
-        // const transform = (h, s, r, u) => {
-        //     const util = parseFloat(u);
-        //     const hc = parseFloat(h);
-        //     const logIneff = Math.log(101 - util);
-
-        //     const waste = hc * (100 - util);
-        //     const startupFriction = (100 - util) * Math.exp(-hc / 10);
-
-        //     return [hc, parseFloat(s), parseFloat(r), logIneff, waste, startupFriction];
-        // };
 
         const transform = (h, s, r, u) => {
             const hc = parseFloat(h);
             const util = parseFloat(u);
-
             // Feature 1: Square root of headcount instead of raw headcount
             // This reduces the "Weight" of large numbers (e.g. 200 becomes 14)
             const normalizedHC = Math.sqrt(hc);
@@ -64,14 +96,21 @@ const predictUnbillable = async (req, res) => {
 
 
         const mlr = new MLR(X, Y);
-        const weights = mlr.weights; // [w_hc, w_soft, w_rent, w_logIneff, w_waste, w_startup]
-
+        const weights = mlr.weights;
         // Prepare Prediction Input
         const inputFeatures = transform(headcount, software_costs, rent, utilization);
 
         // Predict
         const predictionResult = mlr.predict(inputFeatures);
         let predictedUnbillable = predictionResult[0];
+        const totalFixed = parseFloat(rent) + parseFloat(software_costs);
+        let mainDriver;
+
+        // If we used fallback data, we must be stricter with the result
+        if (utilization >= 95 && predictedUnbillable > (totalFixed * 1.5)) {
+            predictedUnbillable = totalFixed + (totalFixed * 0.1); // Bills + 10% overhead
+            mainDriver = "Optimized Base (Global Data Correction)";
+        }
 
         // --- Accurate Driver Logic (Coefficient Analysis via Deviation) ---
         // Feature Names map
@@ -100,7 +139,7 @@ const predictUnbillable = async (req, res) => {
 
         // Identify Main Driver
         const mainDriverObj = impacts.reduce((prev, current) => (prev.abs > current.abs) ? prev : current);
-        let mainDriver = mainDriverObj.name;
+        mainDriver = mainDriverObj.name;
 
         // Semantic Labeling for UI
         if (mainDriver === 'Efficiency Drop (Exponential)' || mainDriver === 'Scale-Adjusted Waste') {
@@ -116,7 +155,7 @@ const predictUnbillable = async (req, res) => {
         }
 
         // --- Guardrail Logic ---
-        const totalFixed = parseFloat(rent) + parseFloat(software_costs);
+        // Guardrail Logic
         if (predictedUnbillable < totalFixed || isNaN(predictedUnbillable)) {
             predictedUnbillable = totalFixed;
             mainDriver = 'Fixed Infrastructure Costs (Floor Hit)';
