@@ -107,9 +107,22 @@ const predictUnbillable = async (req, res) => {
         let mainDriver;
 
         // If we used fallback data, we must be stricter with the result
-        if (utilization >= 95 && predictedUnbillable > (totalFixed * 1.5)) {
-            predictedUnbillable = totalFixed + (totalFixed * 0.1); // Bills + 10% overhead
-            mainDriver = "Optimized Base (Global Data Correction)";
+        // High Efficiency Guardrail: If utilization > 80%, strictly cap the prediction relative to Fixed Costs.
+        // This prevents unrealistic "waste" calculations for small, efficient teams.
+        if (utilization > 80) {
+            const extraAllowed = (100 - utilization) * 0.05; // 0.05 at 99%, 1.0 at 80%? No.
+            // Decay function:
+            // At 80% Util -> Allow 2.0x Fixed (1.0 + 1.0)
+            // At 90% Util -> Allow 1.5x Fixed (1.0 + 0.5)
+            // At 100% Util -> Allow 1.1x Fixed (1.0 + 0.1)
+            const variableMultiplier = 1 + ((100 - utilization) / 20); // 1.0 + 1.0 = 2.0 at 80%. 1.5 at 90%.
+
+            const rigidCap = totalFixed * variableMultiplier;
+
+            if (predictedUnbillable > rigidCap) {
+                predictedUnbillable = rigidCap;
+                // Don't overwrite mainDriver yet, let the feature analysis decide (likely Efficiency or Fixed)
+            }
         }
 
         // --- Accurate Driver Logic (Coefficient Analysis via Deviation) ---
@@ -138,7 +151,18 @@ const predictUnbillable = async (req, res) => {
         });
 
         // Identify Main Driver
-        const mainDriverObj = impacts.reduce((prev, current) => (prev.abs > current.abs) ? prev : current);
+        // CRITICAL FIX: Only consider POSITIVE contributors as the "Driver" of cost.
+        // If Rent is 0, its contribution is negative (Input < Mean), reducing the cost. It isn't the "Driver".
+        const positiveImpacts = impacts.filter(i => i.value > 0);
+
+        let mainDriverObj;
+        if (positiveImpacts.length > 0) {
+            mainDriverObj = positiveImpacts.reduce((prev, current) => (prev.value > current.value) ? prev : current);
+        } else {
+            // Fallback if somehow all contributions are negative (rare, implies prediction < Intercept)
+            mainDriverObj = impacts.reduce((prev, current) => (prev.abs > current.abs) ? prev : current);
+        }
+
         mainDriver = mainDriverObj.name;
 
         // Semantic Labeling for UI
@@ -158,7 +182,9 @@ const predictUnbillable = async (req, res) => {
         // Guardrail Logic
         if (predictedUnbillable < totalFixed || isNaN(predictedUnbillable)) {
             predictedUnbillable = totalFixed;
-            mainDriver = 'Fixed Infrastructure Costs (Floor Hit)';
+            // REMOVED: Overwrite logic. We trust the mainDriver calculated above.
+            // If Software was the biggest impact, it stays Software.
+            // If Efficiency was the biggest impact (even if we hit floor), it stays Efficiency (explains the deviation from ideal floor).
         } else {
             predictedUnbillable = Math.max(0, predictedUnbillable);
         }

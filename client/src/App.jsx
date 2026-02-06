@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import InputForm from './components/InputForm';
 import ForecastCard from './components/ForecastCard';
 import TrendChart from './components/TrendChart';
+import SimulationDashboard from './components/SimulationDashboard';
 
 function App() {
   const [formData, setFormData] = useState({
@@ -137,7 +138,10 @@ function App() {
             {/* Forecast Card */}
             <div className="bg-white rounded-2xl shadow-xl shadow-slate-200/50 border border-slate-100 p-1 min-h-[300px]">
               {prediction ? (
-                <ForecastCard prediction={prediction} formData={formData} />
+                <>
+                  <ForecastCard prediction={prediction} formData={formData} />
+                  <SimulationDashboard prediction={prediction} originalInputs={formData} />
+                </>
               ) : (
                 <div className="h-full flex flex-col items-center justify-center text-slate-400 p-12 border-2 border-dashed border-slate-100 rounded-xl bg-slate-50/50">
                   <svg className="w-16 h-16 mb-4 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
