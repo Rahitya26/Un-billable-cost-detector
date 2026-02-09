@@ -103,25 +103,78 @@ const predictUnbillable = async (req, res) => {
         // Predict
         const predictionResult = mlr.predict(inputFeatures);
         let predictedUnbillable = predictionResult[0];
-        const totalFixed = parseFloat(rent) + parseFloat(software_costs);
+
+        // 1. UNIVERSAL FIXED BASE (Applies to ALL scenarios)
+        // Every company has management/repair overheads, even if remote.
+        // EXCEPTION: Solopreneurs/Tiny Teams (HC <= 2) don't have management overhead.
+        const managementOverhead = headcount <= 2 ? 0 : headcount * 600;
+        const basicFixed = parseFloat(rent) + parseFloat(software_costs);
+        const totalFixed = basicFixed + managementOverhead;
+
         let mainDriver;
+        let smallTeamCorrection = false;
+        let isRemote = parseFloat(rent) === 0;
 
-        // If we used fallback data, we must be stricter with the result
-        // High Efficiency Guardrail: If utilization > 80%, strictly cap the prediction relative to Fixed Costs.
-        // This prevents unrealistic "waste" calculations for small, efficient teams.
-        if (utilization > 80) {
-            const extraAllowed = (100 - utilization) * 0.05; // 0.05 at 99%, 1.0 at 80%? No.
-            // Decay function:
-            // At 80% Util -> Allow 2.0x Fixed (1.0 + 1.0)
-            // At 90% Util -> Allow 1.5x Fixed (1.0 + 0.5)
-            // At 100% Util -> Allow 1.1x Fixed (1.0 + 0.1)
-            const variableMultiplier = 1 + ((100 - utilization) / 20); // 1.0 + 1.0 = 2.0 at 80%. 1.5 at 90%.
+        // 2. CONTEXT-AWARE VARIABLE LOGIC
+        // We refine the ML prediction based on the context (Remote vs Office)
 
-            const rigidCap = totalFixed * variableMultiplier;
+        if (isRemote) {
+            // REMOTE SCENARIO (Rent = 0)
+            // The ML Model likely trained on office data, so it bakes in "Office Waste" (electricity, snacks) into the variable component.
+            // We must STRIP this out for remote teams, while adding our explicit Management Overhead.
 
-            if (predictedUnbillable > rigidCap) {
-                predictedUnbillable = rigidCap;
-                // Don't overwrite mainDriver yet, let the feature analysis decide (likely Efficiency or Fixed)
+            // What the ML thinks is "Variable Waste" (above the basic bills)
+            const impliedTotalWaste = predictedUnbillable - basicFixed;
+
+            // We assume 50% of that waste is "Office Specific" (AC, Security, Cleaning). Remote teams save this.
+            // The other 50% is "Process Waste" (Inefficiency, Meetings) which remains.
+            const remoteVariableWaste = impliedTotalWaste * 0.5;
+
+            // Rebuild prediction: Safe Fixed Base + Reduced Waste
+            predictedUnbillable = totalFixed + remoteVariableWaste;
+
+        } else {
+            // OFFICE SCENARIO
+            // Trust the ML model, but ensure we never drop below our calculated Universal Floor
+            if (predictedUnbillable < totalFixed) {
+                predictedUnbillable = totalFixed;
+            }
+
+            // SANITY CHECK: Universal Cap (e.g. 2.5x Fixed Costs)
+            // Prevents "Standard Office" predictions (like 5.85 Lakh) from exploding relative to 100k Fixed.
+            // 2.5x allows for reasonable office waste, but caps extreme inefficiency penalties.
+            const universalCap = totalFixed * 2.5;
+            if (predictedUnbillable > universalCap) {
+                predictedUnbillable = universalCap;
+            }
+        }
+
+        // 3. SMALL TEAM LOGIC (Headcount < 20)
+        // Overrides the general logic for specific small-team behaviors
+        if (headcount < 20) {
+            if (utilization > 85) {
+                // LEAN TEAM: Reward high efficiency. Prediction -> Fixed + Small Waste
+                const leanWaste = (100 - utilization) * 500; // Very small factor
+                const leanPrediction = totalFixed + leanWaste;
+
+                // Only act if the ML/Remote prediction was higher
+                if (predictedUnbillable > leanPrediction) {
+                    predictedUnbillable = leanPrediction;
+                    smallTeamCorrection = true;
+                }
+            } else {
+                // RISKY TEAM: Penalty for high variance in small teams.
+                const penalty = (100 - utilization) * 500;
+                predictedUnbillable = totalFixed + penalty;
+            }
+        } else {
+            // LARGE TEAM (>20): Keep the existing High Efficiency Clamp Logic
+            if (utilization > 80) {
+                const variableMultiplier = 1 + ((100 - utilization) / 20);
+                const rigidCap = totalFixed * variableMultiplier;
+                if (predictedUnbillable > rigidCap) {
+                    predictedUnbillable = rigidCap;
+                }
             }
         }
 
@@ -150,32 +203,71 @@ const predictUnbillable = async (req, res) => {
             };
         });
 
-        // Identify Main Driver
-        // CRITICAL FIX: Only consider POSITIVE contributors as the "Driver" of cost.
-        // If Rent is 0, its contribution is negative (Input < Mean), reducing the cost. It isn't the "Driver".
-        const positiveImpacts = impacts.filter(i => i.value > 0);
+        // Identify Main Driver (Smart Logic)
 
-        let mainDriverObj;
-        if (positiveImpacts.length > 0) {
-            mainDriverObj = positiveImpacts.reduce((prev, current) => (prev.value > current.value) ? prev : current);
-        } else {
-            // Fallback if somehow all contributions are negative (rare, implies prediction < Intercept)
-            mainDriverObj = impacts.reduce((prev, current) => (prev.abs > current.abs) ? prev : current);
+        // A. Normalcy Check
+        // If the prediction is very close to Fixed Costs (within 20%), it's just standard overhead.
+        const isStandardOverhead = predictedUnbillable <= (totalFixed * 1.25); // Slightly relaxed from 1.2 to 1.25
+
+        // 1. Dominant Cost Check (Software Heavy Scenario)
+        // If Software is huge (> 50% of Fixed) AND we are in a standard cost range, it IS the driver.
+        // BUT if cost is way higher (like 1.36L vs 16k), then Waste is the driver, not Software.
+        if (parseFloat(software_costs) > (totalFixed * 0.5) && isStandardOverhead) {
+            mainDriver = "Software Infrastructure Costs";
         }
+        else if (isStandardOverhead) {
+            mainDriver = "Standard Fixed Overheads";
+        } else {
+            // Maxwell Smart Selection: Pick the highest POSITIVE contributor
+            const positiveImpacts = impacts.filter(i => i.value > 0);
+            let mainDriverObj;
 
-        mainDriver = mainDriverObj.name;
-
-        // Semantic Labeling for UI
-        if (mainDriver === 'Efficiency Drop (Exponential)' || mainDriver === 'Scale-Adjusted Waste') {
-            if (utilization < 75) {
-                mainDriver = `Low Efficiency Impact (${utilization}%)`;
+            if (positiveImpacts.length > 0) {
+                mainDriverObj = positiveImpacts.reduce((prev, current) => (prev.value > current.value) ? prev : current);
             } else {
-                mainDriver = 'Utilization Variance';
+                mainDriverObj = impacts.reduce((prev, current) => (prev.abs > current.abs) ? prev : current);
             }
-        } else if (mainDriver === 'Startup Frictional Waste') {
-            mainDriver = 'Small Team Inefficiency (Startup Friction)';
-        } else if (mainDriver === 'Headcount Volume') {
-            mainDriver = `Headcount Variance`;
+
+            mainDriver = mainDriverObj.name;
+
+            // Priority Refinement: Prevent 'Utilization Variance' if Util > 85%
+            if (utilization > 85 && (mainDriver === 'Efficiency Drop (Exponential)' || mainDriver === 'Scale-Adjusted Waste')) {
+                mainDriver = "Headcount Volume"; // Default to scale driver if efficiency is high
+            }
+
+            // B. Zero Check & Priority Overrides
+
+            // If Driver is "Rent" but Rent is 0 -> call it "Standard Fixed Overheads (Remote)"
+            if (mainDriver === 'Fixed Rent' && parseFloat(rent) === 0) {
+                mainDriver = "Standard Fixed Overheads (Remote)";
+            }
+
+            // C. Priority: Actionable Waste vs Fixed Rent
+            // If Rent is the winner, BUT Waste is also a significantly high impact (> 50% of Rent's impact),
+            // then Pick Waste because it is ACTIONABLE.
+            if (mainDriver === 'Fixed Rent') {
+                const wasteImpact = impacts.find(i => i.name === 'Scale-Adjusted Waste')?.value || 0;
+                const rentImpact = mainDriverObj.value;
+
+                if (wasteImpact > (rentImpact * 0.5)) {
+                    mainDriver = "Scale-Adjusted Waste"; // Override!
+                }
+            }
+
+            // D. Semantic Labeling Cleanup
+            if (mainDriver === 'Efficiency Drop (Exponential)' || mainDriver === 'Scale-Adjusted Waste') {
+                if (utilization <= 75) {
+                    mainDriver = `Low Efficiency Impact (${utilization}%)`;
+                } else if (headcount < 20 && utilization <= 85) {
+                    mainDriver = "Small Team Inefficiency Risk";
+                } else {
+                    mainDriver = 'Utilization Variance';
+                }
+            } else if (mainDriver === 'Startup Frictional Waste') {
+                mainDriver = 'Small Team Inefficiency (Startup Friction)';
+            } else if (mainDriver === 'Headcount Volume') {
+                mainDriver = `Headcount Variance`;
+            }
         }
 
         // --- Guardrail Logic ---
@@ -187,6 +279,38 @@ const predictUnbillable = async (req, res) => {
             // If Efficiency was the biggest impact (even if we hit floor), it stays Efficiency (explains the deviation from ideal floor).
         } else {
             predictedUnbillable = Math.max(0, predictedUnbillable);
+        }
+
+        // --- TRUST BUFFER: Soft Cap Logic ---
+        // Prevents predictions from appearing unrealistically high compared to fixed bills (Rent + Software).
+        // Solution: Apply a 60% discount to any amount exceeding 2.5x of the fixed bills.
+
+        const totalFixedBills = parseFloat(rent) + parseFloat(software_costs);
+        const softCap = totalFixedBills * 2.5;
+
+        // Check for Excess
+        if (predictedUnbillable > softCap) {
+            const excessAmount = predictedUnbillable - softCap;
+
+            // Apply Discount: Reduce excess by 60% (multiply by 0.4)
+            // This acknowledges that idle employees are not 100% wasted cost (some value remains/retention).
+            const discountedExcess = excessAmount * 0.4;
+
+            // Recalculate Prediction
+            predictedUnbillable = softCap + discountedExcess;
+
+            // --- HYBRID DRIVER LOGIC (The Smart Label Fix) ---
+            // If the Bills are huge, but the Waste is huge, acknowledge BOTH.
+            // Check if Software is the dominant part of the base bills (> 60%)
+            const isSoftwareHeavy = parseFloat(software_costs) > (totalFixedBills * 0.60);
+
+            if (isSoftwareHeavy) {
+                // Hybrid Label: Acknowledges both the high bill AND the waste
+                mainDriver = "High Software Costs & Efficiency Drag";
+            } else {
+                // Standard Label: Blames the people
+                mainDriver = "Workforce Efficiency Gap (High Idle Time)";
+            }
         }
 
         res.json({

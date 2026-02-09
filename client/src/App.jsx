@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import InputForm from './components/InputForm';
 import ForecastCard from './components/ForecastCard';
 import TrendChart from './components/TrendChart';
-import SimulationDashboard from './components/SimulationDashboard';
+import CostBreakdown from './components/CostBreakdown';
 
 function App() {
   const [formData, setFormData] = useState({
@@ -140,7 +140,7 @@ function App() {
               {prediction ? (
                 <>
                   <ForecastCard prediction={prediction} formData={formData} />
-                  <SimulationDashboard prediction={prediction} originalInputs={formData} />
+                  <CostBreakdown prediction={prediction} formData={formData} />
                 </>
               ) : (
                 <div className="h-full flex flex-col items-center justify-center text-slate-400 p-12 border-2 border-dashed border-slate-100 rounded-xl bg-slate-50/50">
